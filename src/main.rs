@@ -54,8 +54,8 @@ impl eframe::App for AtemApp {
         // 1. Poll for discovered IPs from the background task
         while let Ok(ip) = self.rx_discovery.try_recv() {
             if !self.discovered_ips.contains(&ip) {
-                self.discovered_ips.push(ip);
                 log::info!("Discovered ATEM device at: {}", ip);
+                self.discovered_ips.push(ip);
             }
         }
 
