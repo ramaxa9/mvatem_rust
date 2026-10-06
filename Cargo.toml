@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.28"
-tokio = { version = "1", features = ["full"] }
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "wgpu"] }
 mdns-sd = "0.9"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
-serde = { version = "1.0", features = ["derive"] }
+nokhwa = { version = "0.10.7", default-features = false, features = ["decoding", "input-msmf"] }
+wgpu = { version = "0.20", default-features = false, features = ["dx12"] }
