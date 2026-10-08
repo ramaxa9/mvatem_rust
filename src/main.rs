@@ -12,6 +12,7 @@ use nokhwa::{
 use std::{
     cmp::Reverse,
     collections::HashMap,
+    net::{IpAddr, SocketAddr, TcpStream},
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
     thread,
     time::{Duration, Instant},
@@ -40,6 +41,7 @@ enum OutputMode {
 enum EthernetCommand {
     Refresh,
     SetOutputMode(String, OutputMode),
+    ConnectManual(IpAddr),
 }
 
 enum CameraEvent {
@@ -51,6 +53,9 @@ enum CameraEvent {
 
 enum EthernetEvent {
     Devices(Vec<String>),
+    Connected(String),
+    Disconnected,
+    SearchComplete,
     Error(String),
 }
 
@@ -76,6 +81,8 @@ struct AtemApp {
     tx_camera_command: mpsc::Sender<CameraCommand>,
     rx_ethernet_event: Receiver<EthernetEvent>,
     tx_ethernet_command: mpsc::Sender<EthernetCommand>,
+    manual_ip_buffer: String,
+    ethernet_status: String,
 }
 
 impl AtemApp {
@@ -100,6 +107,19 @@ impl AtemApp {
             tx_camera_command,
             rx_ethernet_event,
             tx_ethernet_command,
+            manual_ip_buffer: String::new(),
+            ethernet_status: String::new(),
+        }
+    }
+
+    fn connect_atem(&mut self, ip: IpAddr) {
+        self.connected_atem_ip = None;
+        self.ethernet_status = format!("Connecting to ATEM at {ip}...");
+        if let Err(error) = self
+            .tx_ethernet_command
+            .send(EthernetCommand::ConnectManual(ip))
+        {
+            self.ethernet_status = format!("ATEM connection worker stopped: {error}");
         }
     }
 }
@@ -114,9 +134,9 @@ impl eframe::App for AtemApp {
                     self.cameras = cameras;
                     self.is_searching_camera = false;
                     self.camera_status = if self.cameras.is_empty() {
-                        "Blackmagic ATEM Mini USB camera not found.".to_string()
+                        "Blackmagic ATEM Mini USB not found.".to_string()
                     } else {
-                        format!("Found {} Blackmagic camera(s).", self.cameras.len())
+                        format!("Found {} Blackmagic device(s).", self.cameras.len())
                     };
                 }
                 CameraEvent::Connected(name) => {
@@ -140,19 +160,27 @@ impl eframe::App for AtemApp {
         while let Ok(event) = self.rx_ethernet_event.try_recv() {
             match event {
                 EthernetEvent::Devices(ips) => {
-                    if self
-                        .connected_atem_ip
-                        .as_ref()
-                        .is_some_and(|ip| !ips.contains(ip))
-                    {
-                        self.connected_atem_ip = None;
+                    if !ips.is_empty() {
+                        self.is_searching_atem = false;
                     }
                     self.atem_ips = ips;
+                }
+                EthernetEvent::Connected(ip) => {
+                    self.connected_atem_ip = Some(ip.clone());
+                    self.ethernet_status.clear();
+                    log::info!("ATEM control TCP connection established at {ip}:9910");
+                }
+                EthernetEvent::Disconnected => {
+                    self.connected_atem_ip = None;
+                }
+                EthernetEvent::SearchComplete => {
                     self.is_searching_atem = false;
                 }
                 EthernetEvent::Error(error) => {
                     log::error!("{error}");
                     self.is_searching_atem = false;
+                    self.connected_atem_ip = None;
+                    self.ethernet_status = error;
                 }
             }
         }
@@ -252,18 +280,46 @@ impl eframe::App for AtemApp {
                                 "No ATEM devices found."
                             });
                         }
-                        for ip in &self.atem_ips {
+                        for ip in self.atem_ips.clone() {
                             if ui.button(format!("Connect to {ip}")).clicked() {
-                                self.connected_atem_ip = Some(ip.clone());
+                                if let Ok(ip) = ip.parse::<IpAddr>() {
+                                    self.connect_atem(ip);
+                                } else {
+                                    self.ethernet_status =
+                                        format!("Discovered an invalid ATEM IP address: {ip}");
+                                }
                                 ui.close_menu();
                             }
                         }
                     }
+                    if !self.ethernet_status.is_empty() {
+                        ui.label(&self.ethernet_status);
+                    }
+
+                    // ui.separator();
+                    // ui.label("Connect to ATEM control IP:");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.manual_ip_buffer);
+                        ui.label("IP");
+                        if ui.button("Connect").clicked() {
+                            match self.manual_ip_buffer.trim().parse::<IpAddr>() {
+                                Ok(ip) => {
+                                    self.connect_atem(ip);
+                                    self.manual_ip_buffer.clear();
+                                    ui.close_menu();
+                                }
+                                Err(_) => {
+                                    self.ethernet_status =
+                                        "Enter a valid IPv4 or IPv6 address.".to_string();
+                                }
+                            }
+                        }
+                    });
 
                     ui.separator();
                     ui.label(match &self.connected_camera {
                         Some(name) => format!("USB video: {name}"),
-                        None => "USB video: no ATEM webcam connected".to_string(),
+                        None => "USB video: no ATEM device connected".to_string(),
                     });
                     for device in &self.cameras {
                         if self.connected_camera.as_deref() != Some(device.name.as_str())
@@ -295,13 +351,41 @@ impl eframe::App for AtemApp {
                     if ui.button("Reconnect ATEM Ethernet search").clicked() {
                         self.connected_atem_ip = None;
                         self.atem_ips.clear();
+                        self.ethernet_status.clear();
                         self.is_searching_atem = true;
                         if let Err(error) = self.tx_ethernet_command.send(EthernetCommand::Refresh)
                         {
-                            log::error!("ATEM discovery worker stopped: {error}");
+                            self.is_searching_atem = false;
+                            self.ethernet_status =
+                                format!("ATEM discovery worker stopped: {error}");
                         }
                         ui.close_menu();
                     }
+
+                    if self.connected_camera.is_some() {
+                        ui.separator();
+                        if let Some(ip) = &self.connected_atem_ip {
+                            ui.label("Webcam Output Type:");
+                            for (label, mode) in [
+                                ("Multiview", OutputMode::Multiview),
+                                ("Preview", OutputMode::Preview),
+                                ("Program", OutputMode::Program),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    if let Err(error) = self
+                                        .tx_ethernet_command
+                                        .send(EthernetCommand::SetOutputMode(ip.clone(), mode))
+                                    {
+                                        log::error!("ATEM command worker stopped: {error}");
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        } else {
+                            ui.label("(Connect via Ethernet to switch output type)");
+                        }
+                    }
+
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -320,14 +404,27 @@ fn is_blackmagic_camera(info: &CameraInfo) -> bool {
 }
 
 fn discover_cameras() -> anyhow::Result<Vec<AtemCamera>> {
-    Ok(query(ApiBackend::MediaFoundation)?
-        .into_iter()
-        .filter(is_blackmagic_camera)
-        .map(|info| AtemCamera {
-            index: info.index().clone(),
-            name: info.human_name(),
-        })
-        .collect())
+    #[cfg(windows)]
+    let backend = ApiBackend::MediaFoundation;
+    #[cfg(not(windows))]
+    let backend = ApiBackend::Video4Linux;
+
+    let mut cameras_map = std::collections::HashMap::<String, AtemCamera>::new();
+    for info in query(backend)? {
+        if is_blackmagic_camera(&info) {
+            cameras_map.insert(
+                info.human_name().to_string(),
+                AtemCamera {
+                    index: info.index().clone(),
+                    name: info.human_name(),
+                },
+            );
+        }
+    }
+
+    let mut result: Vec<AtemCamera> = cameras_map.into_values().collect();
+    result.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(result)
 }
 
 fn camera_worker(
@@ -338,8 +435,8 @@ fn camera_worker(
     let mut cameras = Vec::new();
     refresh_cameras(&mut cameras, &event_tx);
     let mut camera = cameras
-        .first()
-        .and_then(|device| open_camera(device, &event_tx));
+        .iter()
+        .find_map(|device| open_camera(device, &event_tx));
     let mut last_scan = Instant::now();
     let mut last_frame = Instant::now();
     let mut has_logged_frame = false;
@@ -351,8 +448,8 @@ fn camera_worker(
                 let _ = event_tx.send(CameraEvent::Disconnected);
                 refresh_cameras(&mut cameras, &event_tx);
                 camera = cameras
-                    .first()
-                    .and_then(|device| open_camera(device, &event_tx));
+                    .iter()
+                    .find_map(|device| open_camera(device, &event_tx));
                 last_scan = Instant::now();
             }
             Ok(CameraCommand::Select(index)) => {
@@ -374,8 +471,8 @@ fn camera_worker(
         if camera.is_none() && last_scan.elapsed() >= Duration::from_secs(2) {
             refresh_cameras(&mut cameras, &event_tx);
             camera = cameras
-                .first()
-                .and_then(|device| open_camera(device, &event_tx));
+                .iter()
+                .find_map(|device| open_camera(device, &event_tx));
             last_scan = Instant::now();
         }
 
@@ -531,13 +628,14 @@ fn refresh_cameras(cameras: &mut Vec<AtemCamera>, event_tx: &mpsc::Sender<Camera
 }
 
 fn ethernet_worker(command_rx: Receiver<EthernetCommand>, event_tx: mpsc::Sender<EthernetEvent>) {
-    let service_type = "_atems._tcp.local.";
+    let service_type = "_blackmagic._tcp.local.";
     let mdns = match ServiceDaemon::new() {
         Ok(mdns) => mdns,
         Err(error) => {
             let _ = event_tx.send(EthernetEvent::Error(format!(
                 "Could not start ATEM network discovery: {error}"
             )));
+            let _ = event_tx.send(EthernetEvent::SearchComplete);
             return;
         }
     };
@@ -547,30 +645,66 @@ fn ethernet_worker(command_rx: Receiver<EthernetCommand>, event_tx: mpsc::Sender
             let _ = event_tx.send(EthernetEvent::Error(format!(
                 "Could not search for ATEM devices: {error}"
             )));
+            let _ = event_tx.send(EthernetEvent::SearchComplete);
             return;
         }
     };
     let mut services = HashMap::<String, Vec<String>>::new();
+    let mut search_deadline = Instant::now() + Duration::from_secs(5);
+    let mut control_connection: Option<(IpAddr, TcpStream)> = None;
+    let mut search_is_pending = true;
 
     loop {
         loop {
             match command_rx.try_recv() {
                 Ok(EthernetCommand::Refresh) => {
+                    control_connection = None;
+                    let _ = event_tx.send(EthernetEvent::Disconnected);
                     services.clear();
-                    let _ = event_tx.send(EthernetEvent::Devices(Vec::new()));
                     let _ = mdns.stop_browse(service_type);
                     match mdns.browse(service_type) {
-                        Ok(events) => service_events = events,
+                        Ok(events) => {
+                            service_events = events;
+                            search_deadline = Instant::now() + Duration::from_secs(5);
+                            search_is_pending = true;
+                        }
                         Err(error) => {
                             let _ = event_tx.send(EthernetEvent::Error(format!(
                                 "Could not restart ATEM device search: {error}"
                             )));
+                            let _ = event_tx.send(EthernetEvent::SearchComplete);
+                            search_is_pending = false;
                         }
                     }
                 }
                 Ok(EthernetCommand::SetOutputMode(ip, mode)) => {
-                    // TODO: Send the ATEM protocol command to the selected device over Ethernet.
-                    log::info!("ATEM command requested for {ip} -> Set Output Mode: {mode:?}");
+                    if control_connection
+                        .as_ref()
+                        .is_some_and(|(connected_ip, _)| connected_ip.to_string() == ip)
+                    {
+                        // TODO: Send the ATEM protocol command to the selected device over Ethernet.
+                        log::info!("ATEM command requested for {ip} -> Set Output Mode: {mode:?}");
+                    } else {
+                        log::warn!(
+                            "Ignoring ATEM output-mode request for {ip}: no control connection"
+                        );
+                    }
+                }
+                Ok(EthernetCommand::ConnectManual(ip)) => {
+                    control_connection = None;
+                    let address = SocketAddr::new(ip, 9910);
+                    log::info!("Connecting to ATEM control endpoint {address}");
+                    match TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
+                        Ok(stream) => {
+                            control_connection = Some((ip, stream));
+                            let _ = event_tx.send(EthernetEvent::Connected(ip.to_string()));
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(EthernetEvent::Error(format!(
+                                "Could not connect to ATEM control endpoint {address}: {error}"
+                            )));
+                        }
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -578,6 +712,11 @@ fn ethernet_worker(command_rx: Receiver<EthernetCommand>, event_tx: mpsc::Sender
                     return;
                 }
             }
+        }
+
+        if search_is_pending && Instant::now() >= search_deadline {
+            search_is_pending = false;
+            let _ = event_tx.send(EthernetEvent::SearchComplete);
         }
 
         match service_events.recv_timeout(Duration::from_millis(100)) {
@@ -626,13 +765,18 @@ fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
     // GUI Setup
+    #[cfg(windows)]
+    let supported_backends = eframe::wgpu::Backends::DX12;
+    #[cfg(not(windows))]
+    let supported_backends = eframe::wgpu::Backends::all();
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_maximized(true)
             .with_decorations(false),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            supported_backends: eframe::wgpu::Backends::DX12,
+            supported_backends,
             power_preference: eframe::wgpu::PowerPreference::HighPerformance,
             desired_maximum_frame_latency: Some(1),
             ..Default::default()
